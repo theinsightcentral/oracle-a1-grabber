@@ -1,0 +1,74 @@
+name: oracle-a1-grabber
+
+# Hunts Oracle Always-Free A1.Flex (1 OCPU / 6 GB) capacity 24/7 from GitHub's
+# servers (no PC needed). Idempotent: never creates a second VM. Notifies via
+# Telegram on success. All credentials come from repo Secrets (never in code).
+
+on:
+  schedule:
+    - cron: '*/30 * * * *'   # every 30 min (GitHub may delay; that's fine)
+  workflow_dispatch:           # allow manual runs
+
+concurrency:
+  group: grabber
+  cancel-in-progress: false
+
+jobs:
+  grab:
+    runs-on: ubuntu-latest
+    timeout-minutes: 28
+    env:
+      OCI_CLI_USER: ${{ secrets.OCI_USER }}
+      OCI_CLI_TENANCY: ${{ secrets.OCI_TENANCY }}
+      OCI_CLI_FINGERPRINT: ${{ secrets.OCI_FINGERPRINT }}
+      OCI_CLI_KEY_CONTENT: ${{ secrets.OCI_KEY_CONTENT }}
+      OCI_CLI_REGION: ${{ secrets.OCI_REGION }}
+      COMPARTMENT: ${{ secrets.OCI_TENANCY }}
+      SUBNET: ${{ secrets.OCI_SUBNET }}
+      IMAGE: ${{ secrets.OCI_IMAGE_A1 }}
+      ADS: ${{ secrets.OCI_ADS }}
+      SSH_PUB: ${{ secrets.SSH_PUB }}
+      TG_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TG_CHAT: ${{ secrets.ADMIN_TELEGRAM_CHAT_ID }}
+    steps:
+      - name: Install OCI CLI
+        run: |
+          python3 -m pip install --quiet --upgrade pip
+          python3 -m pip install --quiet oci-cli
+          oci --version
+
+      - name: Hunt A1.Flex capacity
+        run: |
+          set -uo pipefail
+          echo "$SSH_PUB" > key.pub
+          printf '%s' '{"ocpus":1,"memoryInGBs":6}' > shape.json
+
+          # idempotent: if a live gemhunter instance already exists, stop.
+          LIVE=$(oci compute instance list --compartment-id "$COMPARTMENT" --display-name gemhunter --all 2>/dev/null \
+            | python3 -c "import sys,json;d=json.load(sys.stdin).get('data',[]);print(next((i['id'] for i in d if i['lifecycle-state'] in ('RUNNING','PROVISIONING','STARTING')), ''))" 2>/dev/null || true)
+          if [ -n "$LIVE" ]; then echo "Live instance already exists ($LIVE) - nothing to do"; exit 0; fi
+
+          deadline=$(( $(date +%s) + 25*60 ))
+          n=0
+          while [ "$(date +%s)" -lt "$deadline" ]; do
+            for AD in $ADS; do
+              n=$((n+1))
+              ID=$(oci compute instance launch \
+                    --compartment-id "$COMPARTMENT" --availability-domain "$AD" \
+                    --shape VM.Standard.A1.Flex --shape-config file://shape.json \
+                    --image-id "$IMAGE" --subnet-id "$SUBNET" --assign-public-ip true \
+                    --ssh-authorized-keys-file key.pub --display-name gemhunter \
+                    --max-retries 0 --query 'data.id' --raw-output 2>/dev/null || true)
+              if [ -n "$ID" ]; then
+                echo "SECURED capacity in $AD on attempt $n: $ID"
+                if [ -n "${TG_TOKEN:-}" ] && [ -n "${TG_CHAT:-}" ]; then
+                  curl -s "https://api.telegram.org/bot$TG_TOKEN/sendMessage" \
+                    --data-urlencode chat_id="$TG_CHAT" \
+                    --data-urlencode text="✅ Oracle A1 VM conseguida (id ...${ID: -8}). Ya puedo desplegar el bot ahí." >/dev/null || true
+                fi
+                exit 0
+              fi
+            done
+            sleep 35
+          done
+          echo "No capacity in this run after $n attempts"
