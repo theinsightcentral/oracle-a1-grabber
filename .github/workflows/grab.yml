@@ -1,13 +1,12 @@
 name: oracle-a1-grabber
 
-# Hunts Oracle Always-Free A1.Flex (1 OCPU / 6 GB) capacity 24/7 from GitHub's
-# servers (no PC needed). Idempotent: never creates a second VM. Notifies on
-# success (GitHub issue -> email, and Telegram if a chat id is configured).
-# All credentials come from repo Secrets (never in code).
+# Total independence: hunts Oracle A1.Flex capacity 24/7 (no PC), and when it wins,
+# AUTODEPLOYS the bot onto the VM (Node + build + pm2 + boot persistence). Notifies on
+# success (issue "VM-BOT-LIVE" + Telegram) and on deploy failure. Credentials are Secrets.
 
 on:
   schedule:
-    - cron: '*/30 * * * *'   # every 30 min (GitHub may delay; that's fine)
+    - cron: '*/30 * * * *'
   workflow_dispatch:
 
 concurrency:
@@ -20,7 +19,11 @@ permissions:
 jobs:
   grab:
     runs-on: ubuntu-latest
-    timeout-minutes: 28
+    timeout-minutes: 35
+    outputs:
+      secured: ${{ steps.hunt.outputs.secured }}
+      ip: ${{ steps.hunt.outputs.ip }}
+      id: ${{ steps.hunt.outputs.id }}
     env:
       OCI_CLI_USER: ${{ secrets.OCI_USER }}
       OCI_CLI_TENANCY: ${{ secrets.OCI_TENANCY }}
@@ -32,59 +35,110 @@ jobs:
       IMAGE: ${{ secrets.OCI_IMAGE_A1 }}
       ADS: ${{ secrets.OCI_ADS }}
       SSH_PUB: ${{ secrets.SSH_PUB }}
-      TG_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-      TG_CHAT: ${{ secrets.ADMIN_TELEGRAM_CHAT_ID }}
-      GH_TOKEN: ${{ github.token }}
-      REPO: ${{ github.repository }}
     steps:
       - name: Install OCI CLI
         run: |
           python3 -m pip install --quiet --upgrade pip
           python3 -m pip install --quiet oci-cli
           oci --version
-
       - name: Validate OCI auth
         run: |
           set -e
-          echo "OCI auth OK - regions visible: $(oci iam region list --query 'length(data)' --raw-output)"
-
-      - name: Hunt A1.Flex capacity
+          echo "OCI auth OK - regions: $(oci iam region list --query 'length(data)' --raw-output)"
+      - id: hunt
+        name: Hunt A1.Flex capacity
         run: |
           set -uo pipefail
           echo "$SSH_PUB" > key.pub
           printf '%s' '{"ocpus":1,"memoryInGBs":6}' > shape.json
-
-          # idempotent: if a live gemhunter instance already exists, stop.
           LIVE=$(oci compute instance list --compartment-id "$COMPARTMENT" --display-name gemhunter --all 2>/dev/null \
             | python3 -c "import sys,json;d=json.load(sys.stdin).get('data',[]);print(next((i['id'] for i in d if i['lifecycle-state'] in ('RUNNING','PROVISIONING','STARTING')), ''))" 2>/dev/null || true)
-          if [ -n "$LIVE" ]; then echo "Live instance already exists ($LIVE) - nothing to do"; exit 0; fi
-
-          deadline=$(( $(date +%s) + 25*60 ))
-          n=0
-          while [ "$(date +%s)" -lt "$deadline" ]; do
-            for AD in $ADS; do
-              n=$((n+1))
-              ID=$(oci compute instance launch \
-                    --compartment-id "$COMPARTMENT" --availability-domain "$AD" \
-                    --shape VM.Standard.A1.Flex --shape-config file://shape.json \
-                    --image-id "$IMAGE" --subnet-id "$SUBNET" --assign-public-ip true \
-                    --ssh-authorized-keys-file key.pub --display-name gemhunter \
-                    --max-retries 0 --query 'data.id' --raw-output 2>/dev/null || true)
-              if [ -n "$ID" ]; then
-                echo "SECURED capacity in $AD on attempt $n: $ID"
-                # notify via GitHub issue (emails the repo owner)
-                curl -s -X POST -H "Authorization: token $GH_TOKEN" -H "Accept: application/vnd.github+json" \
-                  "https://api.github.com/repos/$REPO/issues" \
-                  -d "{\"title\":\"VM Oracle A1 conseguida\",\"body\":\"Instance ...${ID: -8} esta RUNNING. Ya se puede desplegar el bot.\"}" >/dev/null || true
-                # notify via Telegram (only if a chat id is configured)
-                if [ -n "${TG_TOKEN:-}" ] && [ -n "${TG_CHAT:-}" ]; then
-                  curl -s "https://api.telegram.org/bot$TG_TOKEN/sendMessage" \
-                    --data-urlencode chat_id="$TG_CHAT" \
-                    --data-urlencode text="✅ Oracle A1 VM conseguida (id ...${ID: -8}). Ya puedo desplegar el bot ahi." >/dev/null || true
-                fi
-                exit 0
-              fi
+          if [ -n "$LIVE" ]; then
+            ID="$LIVE"; echo "Live instance already exists: $ID"
+          else
+            deadline=$(( $(date +%s) + 20*60 )); n=0; ID=""
+            while [ "$(date +%s)" -lt "$deadline" ]; do
+              for AD in $ADS; do
+                n=$((n+1))
+                ID=$(oci compute instance launch --compartment-id "$COMPARTMENT" --availability-domain "$AD" \
+                      --shape VM.Standard.A1.Flex --shape-config file://shape.json \
+                      --image-id "$IMAGE" --subnet-id "$SUBNET" --assign-public-ip true \
+                      --ssh-authorized-keys-file key.pub --display-name gemhunter \
+                      --max-retries 0 --query 'data.id' --raw-output 2>/dev/null || true)
+                [ -n "$ID" ] && { echo "SECURED in $AD on attempt $n"; break; }
+              done
+              [ -n "$ID" ] && break
+              sleep 35
             done
-            sleep 35
+          fi
+          if [ -z "$ID" ]; then echo "secured=false" >> "$GITHUB_OUTPUT"; echo "No capacity this run"; exit 0; fi
+          echo "Waiting for RUNNING..."
+          oci compute instance get --instance-id "$ID" --wait-for-state RUNNING --max-wait-seconds 600 >/dev/null 2>&1 || true
+          IP=""
+          for i in $(seq 1 12); do
+            IP=$(oci compute instance list-vnics --instance-id "$ID" --query 'data[0]."public-ip"' --raw-output 2>/dev/null || true)
+            [ -n "$IP" ] && [ "$IP" != "null" ] && break
+            sleep 10
           done
-          echo "No capacity in this run after $n attempts"
+          echo "secured=true" >> "$GITHUB_OUTPUT"
+          echo "id=$ID" >> "$GITHUB_OUTPUT"
+          echo "ip=$IP" >> "$GITHUB_OUTPUT"
+          echo "VM RUNNING at $IP"
+
+  deploy:
+    needs: grab
+    if: needs.grab.outputs.secured == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      IP: ${{ needs.grab.outputs.ip }}
+      ID: ${{ needs.grab.outputs.id }}
+      TG_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TG_CHAT: ${{ secrets.ADMIN_TELEGRAM_CHAT_ID }}
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+    steps:
+      - name: Checkout bot code (private, read-only key)
+        uses: actions/checkout@v4
+        with:
+          repository: theinsightcentral/gemhunter-bot
+          ssh-key: ${{ secrets.BOT_DEPLOY_KEY }}
+          path: bot
+      - name: Prepare SSH key + .env
+        env:
+          SSH_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          ENVF: ${{ secrets.ENV_FILE }}
+        run: |
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/vmkey && chmod 600 ~/.ssh/vmkey
+          printf '%s\n' "$ENVF" > bot/.env
+      - name: Deploy bot to the VM
+        run: |
+          set -e
+          echo "Waiting for SSH on $IP ..."
+          for i in $(seq 1 30); do
+            ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 -i ~/.ssh/vmkey ubuntu@"$IP" 'echo ok' 2>/dev/null && break || sleep 15
+          done
+          tar czf bot.tgz -C bot .
+          scp -o StrictHostKeyChecking=no -i ~/.ssh/vmkey bot.tgz ubuntu@"$IP":~/bot.tgz
+          tr -d '\r' < bot/deploy/vm-setup.sh | ssh -o StrictHostKeyChecking=no -i ~/.ssh/vmkey ubuntu@"$IP" 'bash -s'
+      - name: Notify success
+        if: success()
+        run: |
+          curl -s -X POST -H "Authorization: token $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$REPO/issues" \
+            -d "{\"title\":\"VM-BOT-LIVE\",\"body\":\"Bot desplegado y corriendo en la VM ($IP). La PC ya no es necesaria.\"}" >/dev/null || true
+          if [ -n "${TG_TOKEN:-}" ] && [ -n "${TG_CHAT:-}" ]; then
+            curl -s "https://api.telegram.org/bot$TG_TOKEN/sendMessage" --data-urlencode chat_id="$TG_CHAT" \
+              --data-urlencode text="✅ Bot VIVO en la VM Oracle ($IP). Independencia total lograda - ya no necesitas la PC." >/dev/null || true
+          fi
+      - name: Notify failure
+        if: failure()
+        run: |
+          curl -s -X POST -H "Authorization: token $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$REPO/issues" \
+            -d "{\"title\":\"DEPLOY-FAILED (VM secured)\",\"body\":\"VM ($IP / $ID) capturada pero el deploy automatico fallo. La VM esta segura; desplegar a mano.\"}" >/dev/null || true
+          if [ -n "${TG_TOKEN:-}" ] && [ -n "${TG_CHAT:-}" ]; then
+            curl -s "https://api.telegram.org/bot$TG_TOKEN/sendMessage" --data-urlencode chat_id="$TG_CHAT" \
+              --data-urlencode text="⚠️ VM Oracle capturada ($IP) pero el deploy automatico fallo. La VM esta segura; hay que desplegar a mano." >/dev/null || true
+          fi
