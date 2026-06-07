@@ -19,7 +19,7 @@ permissions:
 jobs:
   grab:
     runs-on: ubuntu-latest
-    timeout-minutes: 35
+    timeout-minutes: 52
     outputs:
       secured: ${{ steps.hunt.outputs.secured }}
       ip: ${{ steps.hunt.outputs.ip }}
@@ -56,7 +56,7 @@ jobs:
           if [ -n "$LIVE" ]; then
             ID="$LIVE"; echo "Live instance already exists: $ID"
           else
-            deadline=$(( $(date +%s) + 20*60 )); n=0; ID=""
+            deadline=$(( $(date +%s) + 45*60 )); n=0; ID=""
             while [ "$(date +%s)" -lt "$deadline" ]; do
               for AD in $ADS; do
                 n=$((n+1))
